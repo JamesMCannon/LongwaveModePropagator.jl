@@ -47,6 +47,7 @@ profile.
     segment.
 - `frequency::Float64`: transmitter frequency in Hertz.
 - `power::Float64`: transmitter power in Watts.
+- `fieldcomponent::Fields.Field`: electromagnetic field component(s) sampled at output_ranges (default Fields.Ez); serialized by name in JSON, e.g. "Ez", "H", "EH".
 - `output_ranges::Vector{Float64}`: distances from the transmitter at which the field will
     be calculated.
 """
@@ -66,12 +67,14 @@ mutable struct ExponentialInput <: Input
     ground_epsrs::Vector{Int}
     frequency::Float64
     power::Float64
+    fieldcomponent::Fields.Field
     output_ranges::Vector{Float64}
 
     function ExponentialInput()
         s = new()
         setfield!(s, :frequency, NaN)
         setfield!(s, :power, 1000.0)
+        setfield!(s, :fieldcomponent, Fields.Ez)
         return s
     end
 end
@@ -102,6 +105,7 @@ StructTypes.StructType(::Type{ExponentialInput}) = StructTypes.Mutable()
     segment.
 - `frequency::Float64`: transmitter frequency in Hertz.
 - `power::Float64`: transmitter power in Watts.
+- `fieldcomponent::Fields.Field`: electromagnetic field component(s) sampled at output_ranges (default Fields.Ez); serialized by name in JSON, e.g. "Ez", "H", "EH".
 - `output_ranges::Vector{Float64}`: distances from the transmitter at which the field will
     be calculated.
 """
@@ -122,12 +126,14 @@ mutable struct TableInput <: Input
     ground_epsrs::Vector{Int}
     frequency::Float64
     power::Float64
+    fieldcomponent::Fields.Field
     output_ranges::Vector{Float64}
 
     function TableInput()
         s = new()
         setfield!(s, :frequency, NaN)
         setfield!(s, :power, 1000.0)
+        setfield!(s, :fieldcomponent, Fields.Ez)
         setfield!(s, :density, [Vector{Float64}()])
         setfield!(s, :collision_frequency, [Vector{Float64}()])
         return s
@@ -188,6 +194,37 @@ end
 StructTypes.StructType(::Type{BasicOutput}) = StructTypes.Mutable()
 
 """
+    FieldsOutput <: Output
+
+Multi-component analog of [`BasicOutput`](@ref): `amplitude[i]` and `phase[i]` are the
+curves for `fieldcomponents[i]` sampled at `output_ranges`.
+
+# Fields
+
+- `name::String`
+- `description::String`
+- `datetime::DateTime`
+- `fieldcomponents::Vector{Fields.Field}`: individual components, ordered by their column
+    in the full field matrix (see [`components`](@ref)).
+- `output_ranges::Vector{Float64}`
+- `amplitude::Vector{Vector{Float64}}`
+- `phase::Vector{Vector{Float64}}`
+"""
+mutable struct FieldsOutput <: Output
+    name::String
+    description::String
+    datetime::DateTime
+
+    fieldcomponents::Vector{Fields.Field}
+    output_ranges::Vector{Float64}
+    amplitude::Vector{Vector{Float64}}
+    phase::Vector{Vector{Float64}}
+
+    FieldsOutput() = new()
+end
+StructTypes.StructType(::Type{FieldsOutput}) = StructTypes.Mutable()
+
+"""
     BatchOutput{T} <: Output
 
 A collection of `outputs` with a batch `name`, `description`, and `datetime`.
@@ -210,6 +247,52 @@ end
 BatchOutput() = BatchOutput{Any}()
 StructTypes.StructType(::Type{<:BatchOutput}) = StructTypes.Mutable()
 jsonsafe!(s::BatchOutput) = jsonsafe!(s.outputs)
+jsonsafe!(v::AbstractVector{<:AbstractVector}) = foreach(jsonsafe!, v)
+
+"""
+    buildoutput(s::Input, amp, phase)
+
+Return a `BasicOutput` when `s.fieldcomponent` is a single component, or a `FieldsOutput`
+when it is a multi-component field (`Fields.E`, `Fields.H`, `Fields.EH`).
+"""
+function buildoutput(s, amp, phase)
+    if numcomponents(s.fieldcomponent) == 1
+        output = BasicOutput()
+        output.amplitude = amp
+        output.phase = phase
+    else
+        output = FieldsOutput()
+        output.fieldcomponents = components(s.fieldcomponent)
+        output.amplitude = [collect(c) for c in eachcol(amp)]
+        output.phase = [collect(c) for c in eachcol(phase)]
+    end
+
+    output.name = s.name
+    output.description = s.description
+    output.datetime = Dates.now()
+    output.output_ranges = s.output_ranges
+
+    jsonsafe!(output.amplitude)
+    jsonsafe!(output.phase)
+
+    return output
+end
+
+"""
+    consistentfieldcomponents(s::BatchInput)
+
+Return `true` if every input in `s` samples the same `fieldcomponent`. A consistent batch
+produces a concretely-typed `BatchOutput{BasicOutput}` or `BatchOutput{FieldsOutput}`.
+"""
+function consistentfieldcomponents(s::BatchInput)
+    (isdefined(s, :inputs) && !isempty(s.inputs)) || return false
+    fc = first(s.inputs).fieldcomponent
+    return all(i -> i.fieldcomponent == fc, s.inputs)
+end
+
+# Output eltype for a (consistent) batch
+batchoutputtype(s::BatchInput) =
+    numcomponents(first(s.inputs).fieldcomponent) == 1 ? BasicOutput : FieldsOutput
 
 """
     iscomplete(s)
@@ -293,24 +376,24 @@ function parse(file)
     # More to less specific
     types = (ExponentialInput, TableInput,
         BatchInput{ExponentialInput}, BatchInput{TableInput}, BatchInput{Any},
-        BasicOutput, BatchOutput{BasicOutput}, BatchOutput{Any})
+        BasicOutput, FieldsOutput,
+        BatchOutput{BasicOutput}, BatchOutput{FieldsOutput}, BatchOutput{Any})
 
-    matched = false
-    let filecontents
-        for t in types
-            filecontents = parse(file, t)
-            if !isnothing(filecontents)
-                matched = true
-                break
-            end
+    errors = []
+    for t in types
+        filecontents = try
+            parse(file, t)
+        catch e
+            push!(errors, t => e)
+            nothing
         end
-
-        if matched
-            return filecontents
-        else
-            error("\"$file\" could not be matched to a valid format.")
-        end
+        isnothing(filecontents) || return filecontents
     end
+
+    msg = "\"$file\" could not be matched to a valid format."
+    isempty(errors) || (msg *= "\nErrors encountered per format:\n" *
+        join(("  $t: $(sprint(showerror, e))" for (t, e) in errors), "\n"))
+    error(msg)
 end
 
 function parse(file, t::Type{<:Input})
@@ -402,30 +485,18 @@ function buildrun(s::ExponentialInput; mesh=nothing, unwrap=true, params=LMPPara
         waveguide = HomogeneousWaveguide(bfield, species, ground)
 
         tx = Transmitter(s.frequency, s.power)
-        rx = GroundSampler(s.output_ranges, Fields.Ez)
+        rx = GroundSampler(s.output_ranges, s.fieldcomponent)
     else
         # SegmentedWaveguide
         waveguide = SegmentedWaveguide([buildwaveguide(s, i) for i in
                                         eachindex(s.segment_ranges)])
         tx = Transmitter(s.frequency, s.power)
-        rx = GroundSampler(s.output_ranges, Fields.Ez)
+        rx = GroundSampler(s.output_ranges, s.fieldcomponent)
     end
 
     _, amp, phase = propagate(waveguide, tx, rx; mesh=mesh, unwrap=unwrap, params=params)
 
-    output = BasicOutput()
-    output.name = s.name
-    output.description = s.description
-    output.datetime = Dates.now()
-
-    output.output_ranges = s.output_ranges
-    output.amplitude = amp
-    output.phase = phase
-
-    jsonsafe!(output.amplitude)
-    jsonsafe!(output.phase)
-
-    return output
+    return buildoutput(s, amp, phase)
 end
 
 function buildrun(s::TableInput; mesh=nothing, unwrap=true, params=LMPParams())
@@ -444,34 +515,25 @@ function buildrun(s::TableInput; mesh=nothing, unwrap=true, params=LMPParams())
         waveguide = HomogeneousWaveguide(bfield, species, ground)
 
         tx = Transmitter(s.frequency, s.power)
-        rx = GroundSampler(s.output_ranges, Fields.Ez)
+        rx = GroundSampler(s.output_ranges, s.fieldcomponent)
     else
         # SegmentedWaveguide
         waveguide = SegmentedWaveguide([buildwaveguide(s, i) for i in eachindex(s.segment_ranges)])
         tx = Transmitter(s.frequency, s.power)
-        rx = GroundSampler(s.output_ranges, Fields.Ez)
+        rx = GroundSampler(s.output_ranges, s.fieldcomponent)
     end
 
     _, amp, phase = propagate(waveguide, tx, rx; mesh=mesh, unwrap=unwrap, params=params)
 
-    output = BasicOutput()
-    output.name = s.name
-    output.description = s.description
-    output.datetime = Dates.now()
-
-    output.output_ranges = s.output_ranges
-    output.amplitude = amp
-    output.phase = phase
-
-    jsonsafe!(output.amplitude)
-    jsonsafe!(output.phase)
-
-    return output
+    return buildoutput(s, amp, phase)
 end
 
 function buildrun(s::BatchInput; mesh=nothing, unwrap=true, params=LMPParams())
 
-    batch = BatchOutput{BasicOutput}()
+    consistentfieldcomponents(s) || throw(ArgumentError(
+        "all inputs in a BatchInput must sample the same fieldcomponent"))
+
+    batch = BatchOutput{batchoutputtype(s)}()
     batch.name = s.name
     batch.description = s.description
     batch.datetime = Dates.now()
@@ -495,13 +557,16 @@ remaining scenarios in `s`. Otherwise, a new `BatchOutput` is created.
 function buildrunsave(outfile, s::BatchInput; append=false, mesh=nothing, unwrap=true,
     params=LMPParams())
 
+    consistentfieldcomponents(s) || throw(ArgumentError(
+        "all inputs in a BatchInput must sample the same fieldcomponent"))
+    T = batchoutputtype(s)
+
     if append && isfile(outfile)
         batch = open(outfile, "r") do f
-            v = JSON3.read(f, BatchOutput{BasicOutput})
-            return v
+            JSON3.read(f, BatchOutput{T})
         end
     else
-        batch = BatchOutput{BasicOutput}()
+        batch = BatchOutput{T}()
         batch.name = s.name
         batch.description = s.description
         batch.datetime = Dates.now()
